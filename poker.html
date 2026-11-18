@@ -162,6 +162,7 @@ html[data-theme=dark] .themebtn{background:rgba(58,65,102,.9)}
 html[data-theme=dark] .ch{box-shadow:0 2px 0 rgba(0,0,0,.35),inset 0 0 0 3px rgba(255,255,255,.55)}
 </style>
 <script>(function(){var t=null;try{t=localStorage.getItem("sp-theme")}catch(e){}if(!t)t=(window.matchMedia&&matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light";document.documentElement.setAttribute("data-theme",t)})()</script>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
 </head>
 <body>
@@ -184,6 +185,8 @@ function lsSet(k,v){try{localStorage.setItem(k,v)}catch(e){}}
 const myId = ssGet('sp-pid') || (()=>{const v=rid(10);ssSet('sp-pid',v);return v})();
 let myName = lsGet('sp-name') || lsGet('pk-name') || lsGet('c21-name') || '';
 let clients = [];
+let peer = null; const p2pConns = new Set(); let p2pTries = 0;
+const PEER_PREFIX = 'seven-mj-v1-';
 const seen = new Set(), lastSeen = {};
 let isHost = false, code = null, state = null, connecting = false, waitStart = 0;
 let lastPeer = 0, errMsg = '', notice = '', leaveArmed = false;
@@ -255,9 +258,44 @@ function handName(s){
 /* ---------- 연결 (MQTT 중계 서버 여러 곳 동시 사용) ---------- */
 function hashCode(){const h=(location.hash||'').slice(1);return /^r-[a-z0-9]{4,10}$/.test(h)?h:''}
 function inviteLink(){return location.href.split('#')[0]+'#'+code}
+/* 1순위: P2P 직접 연결 (빠름) */
+function startP2P(){
+  if(typeof Peer==='undefined') return;
+  const myCode=code;
+  const ready=()=>{ if(connecting){ connecting=false; render() } };
+  if(isHost){
+    const open=(tries)=>{
+      peer=new Peer(PEER_PREFIX+code);
+      peer.on('open', ready);
+      peer.on('connection', c=>{
+        c.on('open', ()=>{ p2pConns.add(c); broadcast(); updateConn() });
+        c.on('data', d=>onMsg(d));
+        c.on('close', ()=>{ p2pConns.delete(c); updateConn() });
+        c.on('error', ()=>{ p2pConns.delete(c) });
+      });
+      peer.on('error', e=>{ if(e.type==='unavailable-id' && tries<5 && code===myCode){ try{peer.destroy()}catch(_){} setTimeout(()=>open(tries+1), 2500) } });
+    };
+    open(0);
+  }else{
+    peer=new Peer();
+    const tryConnect=()=>{
+      if(code!==myCode || !peer || peer.destroyed) return;
+      const c=peer.connect(PEER_PREFIX+code, {reliable:true});
+      c.on('open', ()=>{ p2pConns.add(c); send({t:'hello', name:myName}); ready(); updateConn() });
+      c.on('data', d=>onMsg(d));
+      c.on('close', ()=>{ p2pConns.delete(c); updateConn(); if(code===myCode) setTimeout(tryConnect, 3000) });
+    };
+    peer.on('open', tryConnect);
+    peer.on('error', e=>{ if(e.type==='peer-unavailable' && p2pTries++<8) setTimeout(tryConnect, 3000) });
+  }
+}
+function p2pOpen(){ return [...p2pConns].filter(c=>c.open) }
 function connectRoom(){
-  connecting=true; waitStart=Date.now(); render();
+  connecting=true; waitStart=Date.now(); p2pTries=0; render();
+  startP2P();
+  /* 2순위: 중계 서버 (P2P가 막힐 때 대비) */
   const topic=TOPIC+code;
+  if(typeof mqtt==='undefined') return;
   for(const url of BROKERS){
     let c;
     try{ c = mqtt.connect(url, {clientId:'sp_'+myId+'_'+rid(5), reconnectPeriod:3000, connectTimeout:8000, clean:true}) }catch(e){ continue }
@@ -274,6 +312,8 @@ function connectRoom(){
 }
 function send(m){
   m.from=myId; m.mid=rid(10); seen.add(m.mid);
+  const direct=p2pOpen();
+  if(direct.length){ for(const c of direct){ try{ c.send(m) }catch(e){} } return }
   const txt=JSON.stringify(m), topic=TOPIC+code;
   for(const c of clients){ try{ if(c.connected) c.publish(topic, txt) }catch(e){} }
 }
@@ -503,7 +543,7 @@ function rulesHTML(){
 function render(){
   if(dragging){ pendingRender=true; return }
   const app=$('#app');
-  if(typeof mqtt==='undefined'){ app.innerHTML=`<div class="panel"><h2>앗, 연결 도구를 불러오지 못했어</h2><p>인터넷 연결을 확인하고 새로고침해줘.</p></div>`; return }
+  if(typeof mqtt==='undefined' && typeof Peer==='undefined'){ app.innerHTML=`<div class="panel"><h2>앗, 연결 도구를 불러오지 못했어</h2><p>인터넷 연결을 확인하고 새로고침해줘.</p></div>`; return }
   if(!code) return renderHome();
   if(connecting || !state){ app.innerHTML=`<div class="panel" style="text-align:center"><h2>방 <b>${esc(code)}</b> 에 연결하는 중…</h2><p style="color:var(--soft)">${isHost?'방을 여는 중이야.':(Date.now()-waitStart>10000?'방장을 아직 못 찾았어 🤔 방장이 게임 페이지를 열어뒀는지, 방 코드가 맞는지 확인해줘!':'방장이 게임 페이지를 열어둔 상태여야 해. 잠시만 기다려줘!')}</p><p class="err">${esc(errMsg)}</p><button class="b-sky" id="leave">처음으로</button></div>`; $('#leave').onclick=()=>leave(); return }
   if(!state.players.some(p=>p.id===myId)){ app.innerHTML=`<div class="panel" style="text-align:center"><h2>방이 꽉 찼어 😢</h2><p>이 방은 이미 두 명이 게임 중이야.</p><button class="b-sky" id="leave">처음으로</button></div>`; $('#leave').onclick=()=>leave(); return }
@@ -527,7 +567,8 @@ function renderHome(){
 function leave(msg, silent){
   if(!silent) send({t:'bye'});
   if(isHost && code) ssDel('sp-host:'+code);
-  const old=clients; clients=[]; setTimeout(()=>{ for(const c of old){ try{ c.end(true) }catch(e){} } }, 400);
+  const old=clients, oldPeer=peer; clients=[]; peer=null; p2pConns.clear();
+  setTimeout(()=>{ for(const c of old){ try{ c.end(true) }catch(e){} } try{ oldPeer && oldPeer.destroy() }catch(e){} }, 400);
   code=null; state=null; isHost=false; connecting=false; prev=null; errMsg=typeof msg==='string'?msg:''; notice=''; leaveArmed=false;
   try{ history.replaceState(null,'',location.pathname+location.search) }catch(e){ location.hash='' }
   render();
@@ -712,7 +753,7 @@ function updateConn(){
   const el=$('#conn'); if(!el||!state) return;
   if(state.players.length<2){ el.innerHTML=''; return }
   const ok=Date.now()-lastPeer<9000;
-  el.innerHTML=`<span class="dot" style="background:${ok?'#9fe3cb':'#f9b3cc'}"></span>${ok?'상대와 연결됨':'상대 연결이 끊긴 것 같아… 상대가 페이지를 열어뒀는지 확인해줘'}`;
+  el.innerHTML=`<span class="dot" style="background:${ok?'#9fe3cb':'#f9b3cc'}"></span>${ok?(p2pOpen().length?'⚡ 상대와 직접 연결됨 (빠름)':'🛰️ 중계 서버로 연결됨'):'상대 연결이 끊긴 것 같아… 상대가 페이지를 열어뒀는지 확인해줘'}`;
 }
 /* 다크 모드 전환 */
 function themeIcon(){ const d=document.documentElement.getAttribute('data-theme')==='dark'; const b=$('#theme'); if(b) b.textContent=d?'☀️':'🌙' }
